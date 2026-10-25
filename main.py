@@ -2,7 +2,7 @@ import time
 import network
 import ubinascii
 import machine
-from machine import Pin, ADC, SoftI2C
+from machine import Pin, ADC, PWM, SoftI2C
 import dht
 import framebuf
 from umqtt.simple import MQTTClient
@@ -11,22 +11,33 @@ from umqtt.simple import MQTTClient
 WIFI_SSID = "Wokwi-GUEST"
 WIFI_PASS = ""
 
-BROKER_HOST = "t2cce229.ala.asia-southeast1.emqxsl.com" # Ganti sesuai URL EMQX kamu
+BROKER_HOST = "t2cce229.ala.asia-southeast1.emqxsl.com"
 BROKER_PORT = 8883
-BROKER_USER = "masykur2006"                             # Ganti sesuai username kamu
-BROKER_PASS = "12345678"                                # Ganti sesuai password kamu
+BROKER_USER = "masykur2006"
+BROKER_PASS = "12345678"
 
 DEVICE_NAME   = "esp32-lab-01"
 TOPIC_DATA    = f"iot/{DEVICE_NAME}/telemetry".encode()
 TOPIC_CONTROL = f"iot/{DEVICE_NAME}/cmd/led".encode()
 
 # Konfigurasi Pin Perangkat Keras
-PIN_DHT = 15
-PIN_LED = 2
-PIN_LDR = 34
-PIN_GAS = 35  # --- BARU: Pin ADC1 untuk sensor kualitas udara (MQ) ---
-PIN_SCL = 22
-PIN_SDA = 21
+PIN_DHT    = 15
+PIN_LED    = 2
+PIN_LDR    = 34
+PIN_GAS    = 35
+PIN_SERVO  = 18  # Motor Servo (Ventilasi Otomatis)
+PIN_BUZZER = 19  # Buzzer PWM (Alarm Bahaya)
+PIN_SCL    = 22
+PIN_SDA    = 21
+
+# State Sistem (AUTO / MANUAL)
+system_mode = "AUTO"
+led_state   = "OFF"
+vent_state  = "CLOSED"
+
+# Buffer Moving Average (Edge Computing Filter - 3 sampel terakhir)
+buf_temp, buf_hum, buf_light, buf_air = [], [], [], []
+FILTER_SIZE = 3
 
 
 class OledSSD1306(framebuf.FrameBuffer):
@@ -60,7 +71,7 @@ class OledSSD1306(framebuf.FrameBuffer):
         self.i2c.writeto(self.addr, b"\x40" + self.buffer)
 
 
-# Inisialisasi Sensor, LED, dan Layar OLED
+# Inisialisasi Sensor & Aktuator
 dht_sensor = dht.DHT22(Pin(PIN_DHT))
 led_out = Pin(PIN_LED, Pin.OUT, value=0)
 
@@ -68,22 +79,42 @@ ldr_adc = ADC(Pin(PIN_LDR))
 ldr_adc.atten(ADC.ATTN_11DB)
 ldr_adc.width(ADC.WIDTH_12BIT)
 
-# --- BARU: Inisialisasi ADC Sensor Kualitas Udara ---
 gas_adc = ADC(Pin(PIN_GAS))
 gas_adc.atten(ADC.ATTN_11DB)
 gas_adc.width(ADC.WIDTH_12BIT)
 
+# Setup PWM Servo (50Hz) & Buzzer
+servo_pwm = PWM(Pin(PIN_SERVO), freq=50)
+buzzer_pwm = PWM(Pin(PIN_BUZZER), freq=1000, duty=0)
+
 i2c_bus = SoftI2C(scl=Pin(PIN_SCL), sda=Pin(PIN_SDA), freq=400000)
-try:
-    oled = OledSSD1306(128, 64, i2c_bus, addr=0x3C)
-except OSError:
-    print("Gagal menginisialisasi layar SSD1306")
-    while True:
-        time.sleep(1)
+oled = OledSSD1306(128, 64, i2c_bus, addr=0x3C)
+
+
+def set_servo_angle(angle):
+    """Mengatur sudut motor servo (0 - 180 derajat)."""
+    duty = int(26 + (angle / 180.0) * 102)
+    servo_pwm.duty(duty)
+
+
+def set_buzzer(active, freq=1200):
+    """Mengaktifkan atau mematikan alarm buzzer."""
+    if active:
+        buzzer_pwm.freq(freq)
+        buzzer_pwm.duty(512)
+    else:
+        buzzer_pwm.duty(0)
+
+
+def moving_average(buf, new_val):
+    """Menghitung rata-rata bergerak untuk menghaluskan fluktuasi sensor."""
+    buf.append(new_val)
+    if len(buf) > FILTER_SIZE:
+        buf.pop(0)
+    return sum(buf) / len(buf)
 
 
 def get_air_status(adc_val):
-    """Menentukan kategori kualitas udara dari nilai ADC (0 - 4095)."""
     if adc_val < 1200:
         return "BAIK"
     elif adc_val < 2500:
@@ -92,19 +123,37 @@ def get_air_status(adc_val):
 
 
 def on_mqtt_message(topic, msg_bytes):
-    """Menangani pesan perintah kendali LED dari topik MQTT."""
-    command = msg_bytes.decode("utf-8").strip().upper()
+    """Menangani perintah kontrol dua arah dari MQTT / Bot Telegram."""
+    global system_mode, led_state, vent_state
+    cmd = msg_bytes.decode("utf-8").strip().upper()
+    print(f"[CMD MASUK] {cmd}")
+
     if topic == TOPIC_CONTROL:
-        if command == "ON":
+        if cmd == "MODE_AUTO":
+            system_mode = "AUTO"
+        elif cmd == "MODE_MANUAL":
+            system_mode = "MANUAL"
+            set_buzzer(False)
+        elif cmd == "ON":
+            system_mode = "MANUAL"
             led_out.value(1)
-            print("-> LED ON (remote)")
-        elif command == "OFF":
+            led_state = "ON"
+        elif cmd == "OFF":
+            system_mode = "MANUAL"
             led_out.value(0)
-            print("-> LED OFF (remote)")
+            led_state = "OFF"
+            set_buzzer(False)
+        elif cmd == "VENT_OPEN":
+            system_mode = "MANUAL"
+            set_servo_angle(90)
+            vent_state = "OPEN"
+        elif cmd == "VENT_CLOSE":
+            system_mode = "MANUAL"
+            set_servo_angle(0)
+            vent_state = "CLOSED"
 
 
 def setup_wifi():
-    """Menyambungkan ESP32 ke jaringan Wi-Fi dan menampilkan status di OLED."""
     oled.fill(0)
     oled.text("Menghubungkan", 0, 0)
     oled.text("WiFi...", 0, 10)
@@ -115,12 +164,10 @@ def setup_wifi():
     wlan.connect(WIFI_SSID, WIFI_PASS)
     while not wlan.isconnected():
         time.sleep(0.5)
-
     return wlan
 
 
 def connect_broker():
-    """Membuat koneksi TLS ke broker MQTT dan berlangganan topik."""
     while True:
         try:
             print("[MQTT] Menghubungkan...", end="")
@@ -145,20 +192,21 @@ def connect_broker():
             time.sleep(5)
 
 
-def update_oled_screen(temp, hum, light, air_val, air_stat, led_state, ip_addr):
-    """Memperbarui tampilan layar OLED 128x64 dengan data kualitas udara."""
+def update_oled_screen(temp, hum, light, air_val, air_stat):
     oled.fill(0)
-    oled.text(f"Suhu  : {temp:.1f} C", 0, 0)
-    oled.text(f"Hum   : {hum:.0f} %", 0, 10)
-    oled.text(f"Cahaya: {light}", 0, 20)
-    oled.text(f"Udara : {air_val}({air_stat})", 0, 30)
-    oled.text(f"LED   : {led_state}", 0, 40)
-    oled.text(f"IP: {ip_addr}", 0, 50)
+    oled.text(f"T:{temp:.1f}C H:{hum:.0f}%", 0, 0)
+    oled.text(f"Cahaya: {light}", 0, 11)
+    oled.text(f"Udara : {air_val}({air_stat})", 0, 22)
+    oled.text(f"LED:{led_state} V:{vent_state}", 0, 33)
+    oled.text("-----------------", 0, 44)
+    oled.text(f"Mode: {system_mode}", 0, 54)
     oled.show()
 
 
 def run():
-    wlan = setup_wifi()
+    global led_state, vent_state
+    set_servo_angle(0)
+    setup_wifi()
     mqtt_client = connect_broker()
 
     interval_ms = 5000
@@ -176,25 +224,41 @@ def run():
 
             try:
                 dht_sensor.measure()
-                temp = dht_sensor.temperature()
-                hum = dht_sensor.humidity()
+                raw_t = dht_sensor.temperature()
+                raw_h = dht_sensor.humidity()
             except OSError:
                 continue
 
-            light_val = 4095 - ldr_adc.read()
-            air_val   = gas_adc.read()  # Semakin tinggi nilai = semakin pekat gas/polusi
+            raw_l = 4095 - ldr_adc.read()
+            raw_a = gas_adc.read()
+
+            # Edge Computing: Haluskan pembacaan dengan Moving Average
+            temp      = moving_average(buf_temp, raw_t)
+            hum       = moving_average(buf_hum, raw_h)
+            light_val = int(moving_average(buf_light, raw_l))
+            air_val   = int(moving_average(buf_air, raw_a))
             air_stat  = get_air_status(air_val)
 
-            # Rule lokal: LED menyala jika suhu di atas 30 C ATAU kualitas udara BURUK
-            if temp > 30.0 or air_val >= 2500:
-                led_out.value(1)
-                led_state = "ON"
-            else:
-                led_out.value(0)
-                led_state = "OFF"
+            # Logika Otomatis hanya berjalan jika dalam mode AUTO
+            if system_mode == "AUTO":
+                if temp > 30.0 or air_val >= 2500:
+                    led_out.value(1)
+                    led_state = "ON"
+                    set_buzzer(True, freq=1500 if air_val >= 2500 else 900)
+                else:
+                    led_out.value(0)
+                    led_state = "OFF"
+                    set_buzzer(False)
 
-            ip_address = wlan.ifconfig()[0]
-            update_oled_screen(temp, hum, light_val, air_val, air_stat, led_state, ip_address)
+                # Buka ventilasi (Servo 90°) jika udara BURUK atau suhu > 32°C
+                if air_val >= 2500 or temp > 32.0:
+                    set_servo_angle(90)
+                    vent_state = "OPEN"
+                else:
+                    set_servo_angle(0)
+                    vent_state = "CLOSED"
+
+            update_oled_screen(temp, hum, light_val, air_val, air_stat)
 
             json_payload = (
                 f'{{"temperature":{temp:.1f},'
@@ -202,7 +266,9 @@ def run():
                 f'"light":{light_val},'
                 f'"air_quality":{air_val},'
                 f'"air_status":"{air_stat}",'
-                f'"led":"{led_state}"}}'
+                f'"led":"{led_state}",'
+                f'"vent":"{vent_state}",'
+                f'"mode":"{system_mode}"}}'
             )
 
             try:
