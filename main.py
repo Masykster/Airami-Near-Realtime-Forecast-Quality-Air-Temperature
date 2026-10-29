@@ -7,10 +7,9 @@ import dht
 import framebuf
 from umqtt.simple import MQTTClient
 
-
 # KONFIGURASI JARINGAN & BROKER MQTT
-WIFI_SSID = "Wokwi-GUEST"
-WIFI_PASS = ""
+WIFI_SSID   = "Wokwi-GUEST"
+WIFI_PASS   = ""
 
 BROKER_HOST = "y16d2f91.ala.asia-southeast1.emqxsl.com"
 BROKER_PORT = 8883
@@ -22,60 +21,64 @@ TOPIC_DATA    = f"iot/{DEVICE_NAME}/telemetry".encode()
 TOPIC_CONTROL = f"iot/{DEVICE_NAME}/cmd/led".encode()
 
 # KONFIGURASI PIN
-PIN_DHT    = 15
-PIN_LED_R  = 2    # Merah  (Buruk)
-PIN_LED_Y  = 4    # Kuning (Sedang)
-PIN_LED_G  = 5    # Hijau  (Baik)
-PIN_LDR    = 34
-PIN_GAS    = 35
-PIN_SERVO  = 18
-PIN_BUZZER = 19
-PIN_SCL    = 22
-PIN_SDA    = 21
+PIN_DHT     = 15
+PIN_LED_R   = 2    # Merah  (Buruk / Bahaya Karhutla)
+PIN_LED_Y   = 4    # Kuning (Sedang / Waspada)
+PIN_LED_G   = 5    # Hijau  (Baik / Udara Bersih)
+PIN_SMOKE   = 33   # Sensor Partikel Asap PM2.5 (Slide Potentiometer)
+PIN_LDR     = 34   # Sensor Cahaya (Visibilitas Kabut Asap)
+PIN_GAS     = 35   # Sensor Gas Pembakaran CO2 (MQ-2)
+PIN_SERVO   = 18
+PIN_BUZZER  = 19
+PIN_SCL     = 22
+PIN_SDA     = 21
 
-# PARAMETER SISTEM
+# PARAMETER SISTEM & AMBANG BATAS AQI (Jurnal Azizah et al., 2025)
 READ_MS           = 1000     
 PUB_MS            = 5000     
 RETRY_MS          = 5000     
 BLINK_MS          = 250     
 FILTER_SIZE       = 3        
 
-WARN_DELTA        = 100    
-                            
+AQI_TH_SEDANG     = 51       # AQI 51-100: Moderate
+AQI_TH_BURUK      = 101      # AQI >= 101: Unhealthy
+HYST_AQI          = 4        # Histeresis AQI
+
+WARN_DELTA_AQI    = 15       # Lonjakan AQI mendadak (>= 15 poin/detik)
 WARN_HOLD_MS      = 10000    
-HYST              = 100     
 TEMP_HOT          = 32.0     
 MANUAL_TIMEOUT_MS = 300000   
 
 # STATE SISTEM
-system_mode = "AUTO"
-manual_since = 0
-led_state   = "OFF"
-vent_state  = "CLOSED"
-servo_angle = -1     
+system_mode   = "AUTO"
+manual_since  = 0
+led_state     = "GREEN"
+vent_state    = "OPEN_CLEAN(180)"
+servo_angle   = -1     
 
-# Kalibrasi dinamis
-gas_baseline  = 0
-gas_th_sedang = 1000
-gas_th_buruk  = 2000
-prev_air_val  = None 
+gas_zero_adc  = 0            # Menyimpan titik nol sensor gas Wokwi saat boot
+prev_aqi_val  = None 
 early_warning = False
 warn_until    = 0
 
-# Data sensor terakhir
-temp = 0.0
-hum = 0.0
-light_val = 0
-air_val = 0
-air_stat = "BAIK"
-have_data = False
+# Data sensor (5 Parameter) & hasil klasifikasi
+temp       = 0.0
+hum        = 0.0
+light_val  = 0
+pm25_val   = 0.0
+co2_val    = 400
+env_factor = 1.0
+aqi_val    = 0
+smoke_stat = "AMAN"
+air_stat   = "BAIK"
+have_data  = False
 
 # Status koneksi
 mqtt_client = None
-mqtt_ok = False
+mqtt_ok     = False
 
-# Buffer moving average
-buf_temp, buf_hum, buf_light, buf_air = [], [], [], []
+# Buffer moving average untuk kelima parameter
+buf_temp, buf_hum, buf_light, buf_smoke, buf_gas = [], [], [], [], []
 
 # DRIVER OLED SSD1306
 class OledSSD1306(framebuf.FrameBuffer):
@@ -113,6 +116,10 @@ led_r = Pin(PIN_LED_R, Pin.OUT, value=0)
 led_y = Pin(PIN_LED_Y, Pin.OUT, value=0)
 led_g = Pin(PIN_LED_G, Pin.OUT, value=0)
 
+smoke_adc = ADC(Pin(PIN_SMOKE))
+smoke_adc.atten(ADC.ATTN_11DB)
+smoke_adc.width(ADC.WIDTH_12BIT)
+
 ldr_adc = ADC(Pin(PIN_LDR))
 ldr_adc.atten(ADC.ATTN_11DB)
 ldr_adc.width(ADC.WIDTH_12BIT)
@@ -126,16 +133,15 @@ buzzer_pwm = PWM(Pin(PIN_BUZZER), freq=1000, duty=0)
 i2c_bus = SoftI2C(scl=Pin(PIN_SCL), sda=Pin(PIN_SDA), freq=400000)
 oled = OledSSD1306(128, 64, i2c_bus, addr=0x3C)
 
-# FUNGSI BANTU AKTUATOR
+# FUNGSI BANTU AKTUATOR & MATEMATIKA
 def set_servo_angle(angle):
-    """Set sudut servo 0-180. Tidak menulis ulang PWM kalau sudut sama."""
+    """Set sudut servo 0-180. 0 = Ventilasi Tertutup, 180 = Terbuka Penuh."""
     global servo_angle
     angle = max(0, min(180, int(angle)))
     if angle == servo_angle:
         return
     servo_angle = angle
     servo_pwm.duty(int(26 + (angle / 180.0) * 102))
-
 
 def set_buzzer(active, freq=1200):
     if active:
@@ -144,12 +150,10 @@ def set_buzzer(active, freq=1200):
     else:
         buzzer_pwm.duty(0)
 
-
 def set_leds(r, y, g):
     led_r.value(r)
     led_y.value(y)
     led_g.value(g)
-
 
 def moving_average(buf, new_val):
     buf.append(new_val)
@@ -157,71 +161,166 @@ def moving_average(buf, new_val):
         buf.pop(0)
     return sum(buf) / len(buf)
 
-
 def map_value(x, in_min, in_max, out_min, out_max):
-    """Pemetaan linear proporsional dengan clamp."""
     if in_max == in_min:
         return out_min
     val = int((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
     return max(min(val, out_max), out_min)
 
-# LOGIKA STATUS UDARA
-def update_air_status(stat, v):
+# KALIBRASI TITIK NOL SENSOR GAS WOKWI SAAT BOOT
+def calibrate_gas_zero():
+    """
+    Di Wokwi, wokwi-gas-sensor memiliki nilai ADC default ~2150 saat start.
+    Kita jadikan bacaan awal tersebut sebagai titik 400 ppm (udara bersih)
+    agar sistem tidak langsung error 'BURUK' saat pertama kali di-run.
+    """
+    global gas_zero_adc
+    oled.fill(0)
+    oled.text("Inisialisasi...", 0, 15)
+    oled.text("Kalibrasi Sensor", 0, 30)
+    oled.show()
+    
+    total = 0
+    for _ in range(4):
+        total += gas_adc.read()
+        time.sleep(0.2)
+    gas_zero_adc = int(total / 4)
+    print(f"[BOOT] Titik nol ADC Gas Wokwi dikalibrasi pada: {gas_zero_adc}")
+
+# PERHITUNGAN KLASIFIKASI 5 PARAMETER (PM2.5, CO2, SUHU, HUMIDITY, CAHAYA)
+def calculate_aqi_pm25(pm25):
+    """1. Sub-Indeks Parameter Asap PM2.5 sesuai Tabel 1 & 5 Jurnal."""
+    breakpoints = [
+        (0.0, 12.0, 0, 50),        # Good (Baik)
+        (12.1, 35.4, 51, 100),     # Moderate (Sedang)
+        (35.5, 55.4, 101, 150),    # Unhealthy for Sensitive Groups
+        (55.5, 150.4, 151, 200),   # Unhealthy
+        (150.5, 250.4, 201, 300),  # Very Unhealthy
+        (250.5, 500.0, 301, 500)   # Hazardous
+    ]
+    c = max(0.0, min(pm25, 500.0))
+    for c_low, c_high, i_low, i_high in breakpoints:
+        if c <= c_high:
+            return int(((i_high - i_low) / (c_high - c_low)) * (c - c_low) + i_low)
+    return 500
+
+def calculate_aqi_co2(co2_ppm):
+    """
+    2. Sub-Indeks Parameter Gas CO2 sesuai Gambar 4 & 7 Jurnal:
+    - 400 - 700 ppm  -> AQI 0 - 50 (Baik)
+    - 701 - 1200 ppm -> AQI 51 - 100 (Sedang; di jurnal 850 ppm = AQI 75)
+    - 1201 - 3000 ppm -> AQI 101 - 300 (Buruk)
+    """
+    if co2_ppm <= 700:
+        return map_value(co2_ppm, 400, 700, 0, 50)
+    elif co2_ppm <= 1200:
+        return map_value(co2_ppm, 701, 1200, 51, 100)
+    else:
+        return map_value(co2_ppm, 1201, 3000, 101, 300)
+
+def calculate_multisensor_aqi(pm25, co2_ppm, t, h, light):
+    """
+    Menggabungkan ke-5 parameter:
+    - PM2.5 (Asap) & CO2 (Gas) sebagai indeks polutan dasar
+    - Suhu (t), Kelembapan (h), dan Cahaya (light) sebagai pengali risiko Karhutla
+    """
+    global env_factor
+    aqi_pm  = calculate_aqi_pm25(pm25)
+    aqi_gas = calculate_aqi_co2(co2_ppm)
+
+    # Jika salah satu polutan ekstrem, gunakan nilai tertinggi; jika normal, gunakan rata-rata berbobot
+    if aqi_pm >= 101 or aqi_gas >= 101:
+        base_aqi = max(aqi_pm, aqi_gas)
+    else:
+        base_aqi = (0.6 * aqi_pm) + (0.4 * aqi_gas)
+
+    # Hitung Faktor Lingkungan dari Suhu, Kelembapan, dan Cahaya (Visibilitas)
+    factor = 1.0
+    
+    # Parameter 3: Suhu (Panas ekstrem > 33C meningkatkan risiko Karhutla +10%)
+    if t > 33.0:
+        factor += 0.10
+        
+    # Parameter 4: Kelembapan (Udara kering < 45% membuat asap bertahan di udara +10%)
+    if h < 45.0:
+        factor += 0.10
+    elif h > 70.0:
+        factor -= 0.05  # Kelembapan tinggi membantu mengendapkan partikel
+        
+    # Parameter 5: Cahaya/LDR (Visibilitas rendah < 1200 saat ada polutan = Kabut Asap Pekat +15%)
+    if light < 1200 and base_aqi > 30:
+        factor += 0.15
+
+    env_factor = round(factor, 2)
+    final_aqi = int(min(500, max(0, base_aqi * env_factor)))
+    return final_aqi
+
+def evaluate_smoke_status(pm25, co2_ppm, light):
+    """Menentukan status kepekatan asap dari PM2.5, CO2, dan visibilitas cahaya."""
+    if pm25 >= 35.5 or co2_ppm >= 1201 or (pm25 >= 25.0 and light < 1000):
+        return "PEKAT"
+    elif pm25 >= 12.1 or co2_ppm >= 701:
+        return "TIPIS"
+    return "AMAN"
+
+def update_air_status(stat, aqi):
+    """Klasifikasi status udara (BAIK, SEDANG, BURUK) dengan histeresis."""
     if stat == "BAIK":
-        if v >= gas_th_buruk:
+        if aqi >= AQI_TH_BURUK:
             return "BURUK"
-        if v >= gas_th_sedang:
+        if aqi >= AQI_TH_SEDANG:
             return "SEDANG"
         return "BAIK"
     if stat == "SEDANG":
-        if v >= gas_th_buruk:
+        if aqi >= AQI_TH_BURUK:
             return "BURUK"
-        if v < gas_th_sedang - HYST:
+        if aqi < AQI_TH_SEDANG - HYST_AQI:
             return "BAIK"
         return "SEDANG"
-    if v < gas_th_buruk - HYST:
-        if v < gas_th_sedang - HYST:
+    if aqi < AQI_TH_BURUK - HYST_AQI:
+        if aqi < AQI_TH_SEDANG - HYST_AQI:
             return "BAIK"
         return "SEDANG"
     return "BURUK"
 
-
-# LOGIKA OTOMATIS
-# Prioritas: BURUK > EARLY WARNING > SEDANG > BAIK, lalu override suhu
+# LOGIKA OTOMATIS MITIGASI KARHUTLA
 def apply_auto():
     global led_state, vent_state
 
-    if air_stat == "BURUK":
+    if air_stat == "BURUK" or smoke_stat == "PEKAT":
         set_leds(1, 0, 0)
         led_state = "RED"
-        angle = 180
-        vent_state = "OPEN_MAX(180)"
+        angle = 0  # TUTUP RAPAT ventilasi (0 deg) agar asap tidak masuk
+        vent_state = "CLOSED_SMOKE(0)"
         set_buzzer(True, 1500)
 
     elif early_warning:
-        # LED kuning di-blink oleh loop utama
         led_r.value(0)
         led_g.value(0)
         led_state = "WARNING_BLINK"
-        angle = 90
-        vent_state = "PRE-OPEN(90)"
+        angle = 30 # Siaga tutup (30 deg) karena lonjakan mendadak
+        vent_state = "PRE-CLOSE(30)"
         set_buzzer(True, 2000)
 
-    elif air_stat == "SEDANG":
+    elif air_stat == "SEDANG" or smoke_stat == "TIPIS":
         set_leds(0, 1, 0)
         led_state = "YELLOW"
-        angle = map_value(air_val, gas_th_sedang, gas_th_buruk, 0, 180)
-        vent_state = f"PROP({angle})"
+        # Semakin tinggi AQI (51 -> 100), sudut servo semakin menutup (150 -> 30 deg)
+        closing_offset = map_value(aqi_val, AQI_TH_SEDANG, AQI_TH_BURUK, 30, 150)
+        angle = 180 - closing_offset
+        vent_state = f"PROP_CLOSE({angle})"
         set_buzzer(False)
 
-    else: 
+    else: # Udara BAIK & AMAN
         set_leds(0, 0, 1)
         led_state = "GREEN"
-        angle = 0
-        vent_state = "CLOSED(0)"
+        angle = 180 # BUKA PENUH (180 deg)
+        vent_state = "OPEN_CLEAN(180)"
         set_buzzer(False)
 
-    if temp > TEMP_HOT and not early_warning and air_stat != "BURUK":
+    # Parameter Suhu juga mengontrol servo: jika suhu ruangan panas (>32C) 
+    # dan udara luar masih BERSIH, pastikan ventilasi terbuka penuh (180 deg)
+    if temp > TEMP_HOT and air_stat == "BAIK" and smoke_stat == "AMAN" and not early_warning:
         angle = 180
         vent_state = "TEMP_OPEN(180)"
 
@@ -233,16 +332,13 @@ def enter_manual():
     system_mode = "MANUAL"
     manual_since = time.ticks_ms()
 
-
 def check_manual_timeout(now):
-    """Kalau terlalu lama di MANUAL, kembali ke AUTO supaya sistem tidak 'lupa' menjaga udara."""
     global system_mode
     if system_mode == "MANUAL" and time.ticks_diff(now, manual_since) >= MANUAL_TIMEOUT_MS:
         system_mode = "AUTO"
         print("[MODE] Timeout MANUAL -> AUTO")
         if have_data:
             apply_auto()
-
 
 def on_mqtt_message(topic, msg_bytes):
     global system_mode, led_state, vent_state
@@ -274,11 +370,11 @@ def on_mqtt_message(topic, msg_bytes):
     elif cmd == "VENT_OPEN":
         enter_manual()
         set_servo_angle(180)
-        vent_state = "OPEN_MAX"
+        vent_state = "MANUAL_OPEN(180)"
     elif cmd == "VENT_CLOSE":
         enter_manual()
         set_servo_angle(0)
-        vent_state = "CLOSED"
+        vent_state = "MANUAL_CLOSED(0)"
 
 # JARINGAN
 def setup_wifi():
@@ -289,14 +385,11 @@ def setup_wifi():
     wlan.active(True)
     wlan.connect(WIFI_SSID, WIFI_PASS)
     t0 = time.ticks_ms()
-    # Tunggu maksimal 15 detik; kalau gagal, sistem tetap jalan offline
     while not wlan.isconnected() and time.ticks_diff(time.ticks_ms(), t0) < 15000:
         time.sleep(0.5)
     return wlan
 
-
 def try_connect():
-    """Satu kali percobaan konek MQTT. Return client atau None (tidak ada loop tak terbatas)."""
     try:
         print("[MQTT] Menghubungkan...", end="")
         uid = ubinascii.hexlify(machine.unique_id()).decode()
@@ -319,7 +412,6 @@ def try_connect():
         print(f" gagal ({err})")
         return None
 
-
 def close_mqtt():
     global mqtt_client, mqtt_ok
     try:
@@ -330,32 +422,12 @@ def close_mqtt():
     mqtt_client = None
     mqtt_ok = False
 
-# KALIBRASI AWAL
-def auto_calibrate():
-    """Ambil baseline gas saat boot. Threshold dibatasi agar tidak melebihi rentang ADC 12-bit."""
-    global gas_baseline, gas_th_sedang, gas_th_buruk
-    oled.fill(0)
-    oled.text("Kalibrasi Gas...", 0, 10)
-    oled.text("Harap Tunggu 3s", 0, 25)
-    oled.show()
-
-    total = 0
-    for _ in range(6):
-        total += gas_adc.read()
-        time.sleep(0.5)
-
-    gas_baseline = int(total / 6)
-    gas_th_buruk = min(gas_baseline + 1600, 3800)
-    gas_th_sedang = min(gas_baseline + 600, 3300)
-    if gas_th_buruk - gas_th_sedang < 300: 
-        gas_th_sedang = gas_th_buruk - 300
-    print(f"[KALIBRASI] Baseline: {gas_baseline} | Sedang: {gas_th_sedang} | Buruk: {gas_th_buruk}")
-
-# PEMBACAAN SENSOR
+# PEMBACAAN 5 SENSOR & PERHITUNGAN KLASIFIKASI
 def read_sensors(now):
-    global temp, hum, light_val, air_val, air_stat
-    global prev_air_val, early_warning, warn_until, have_data
+    global temp, hum, light_val, pm25_val, co2_val, aqi_val, smoke_stat, air_stat
+    global prev_aqi_val, early_warning, warn_until, have_data
 
+    # 1 & 2. Baca Suhu dan Kelembapan (DHT22)
     try:
         dht_sensor.measure()
         temp = moving_average(buf_temp, dht_sensor.temperature())
@@ -363,16 +435,32 @@ def read_sensors(now):
     except OSError:
         pass
 
-    light_val = int(moving_average(buf_light, 4095 - ldr_adc.read()))
-    air_val = int(moving_average(buf_air, gas_adc.read()))
+    # 3, 4, 5. Baca Cahaya (LDR), Asap PM2.5 (Potensiometer), dan Gas (MQ-2)
+    raw_light = moving_average(buf_light, 4095 - ldr_adc.read())
+    raw_smoke = moving_average(buf_smoke, smoke_adc.read())
+    raw_gas   = moving_average(buf_gas, gas_adc.read())
 
-    # Rate of change
-    delta_air = 0 if prev_air_val is None else (air_val - prev_air_val)
-    prev_air_val = air_val
+    light_val = int(raw_light)
+    pm25_val  = round((raw_smoke / 4095.0) * 300.0, 1)
 
-    air_stat = update_air_status(air_stat, air_val)
+    # Hitung kenaikan gas di atas titik nol awal (gas_zero_adc)
+    # Jika slider gas digeser naik melebihi posisi awal, CO2 naik dari 400 hingga 3000 ppm
+    if raw_gas <= gas_zero_adc:
+        co2_val = 400
+    else:
+        span = max(1, 4095 - gas_zero_adc)
+        co2_val = int(400 + ((raw_gas - gas_zero_adc) / span) * 2600)
 
-    if delta_air > WARN_DELTA:
+    # Hitung AQI Gabungan dari 5 Parameter (PM2.5, CO2, Temp, Hum, Light)
+    aqi_val    = calculate_multisensor_aqi(pm25_val, co2_val, temp, hum, light_val)
+    smoke_stat = evaluate_smoke_status(pm25_val, co2_val, light_val)
+    air_stat   = update_air_status(air_stat, aqi_val)
+
+    # Deteksi lonjakan AQI mendadak (Early Warning)
+    delta_aqi = 0 if prev_aqi_val is None else (aqi_val - prev_aqi_val)
+    prev_aqi_val = aqi_val
+
+    if delta_aqi >= WARN_DELTA_AQI:
         early_warning = True
         warn_until = time.ticks_add(now, WARN_HOLD_MS)
     elif early_warning and time.ticks_diff(now, warn_until) >= 0:
@@ -384,11 +472,11 @@ def read_sensors(now):
 def update_oled_screen():
     oled.fill(0)
     oled.text(f"T:{temp:.1f}C H:{hum:.0f}%", 0, 0)
-    oled.text(f"Luminos:{light_val}", 0, 11)
-    oled.text(f"Gas:{air_val} {air_stat}", 0, 22)
-    oled.text(f"Vent:{servo_angle} deg", 0, 33)
-    oled.text(f"M:{system_mode} W:{'Y' if early_warning else 'N'}", 0, 44)
-    oled.text(f"MQTT:{'OK' if mqtt_ok else 'OFF'}", 0, 55)
+    oled.text(f"PM25:{pm25_val:.0f} CO2:{co2_val}", 0, 11)
+    oled.text(f"Lux:{light_val} Env:{env_factor}x", 0, 22)
+    oled.text(f"AQI:{aqi_val} ({air_stat})", 0, 33)
+    oled.text(f"Asap:{smoke_stat} V:{servo_angle}", 0, 44)
+    oled.text(f"M:{system_mode} MQTT:{'OK' if mqtt_ok else 'X'}", 0, 55)
     oled.show()
 
 # PUBLISH TELEMETRI
@@ -400,10 +488,15 @@ def publish_telemetry():
         f'{{"temperature":{temp:.1f},'
         f'"humidity":{hum:.0f},'
         f'"light":{light_val},'
-        f'"air_quality":{air_val},'
+        f'"pm25":{pm25_val},'
+        f'"co2_ppm":{co2_val},'
+        f'"env_multiplier":{env_factor},'
+        f'"aqi":{aqi_val},'
+        f'"smoke_status":"{smoke_stat}",'
         f'"air_status":"{air_stat}",'
         f'"led":"{led_state}",'
         f'"vent":"{vent_state}",'
+        f'"servo_angle":{servo_angle},'
         f'"warning":{str(early_warning).lower()},'
         f'"mode":"{system_mode}"}}'
     )
@@ -418,9 +511,12 @@ def publish_telemetry():
 def run():
     global mqtt_client, mqtt_ok
 
-    set_servo_angle(0)
+    # Saat baru menyala, ventilasi terbuka (180 deg) dan LED Hijau menyala
+    set_servo_angle(180)
+    set_leds(0, 0, 1)
+    
     wlan = setup_wifi()
-    auto_calibrate()
+    calibrate_gas_zero()
 
     mqtt_client = try_connect()
     mqtt_ok = mqtt_client is not None
@@ -473,7 +569,6 @@ def run():
             publish_telemetry()
 
         time.sleep(0.05)
-
 
 if __name__ == "__main__":
     run()

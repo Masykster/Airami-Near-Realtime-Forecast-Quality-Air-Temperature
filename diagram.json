@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "author": "Smart Environment Monitor AIoT",
-  "editor": "izin ke toilet",
+  "author": "Smart Environment Monitor AIoT - Karhutla Edition",
+  "editor": "wokwi",
   "parts": [
-    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": -4.76, "attrs": {} },
     {
       "type": "board-ssd1306",
       "id": "oled1",
@@ -16,7 +16,7 @@
       "id": "dht1",
       "top": 96.3,
       "left": 177,
-      "attrs": { "humidity": "30", "temperature": "30.3" }
+      "attrs": { "humidity": "100", "temperature": "80" }
     },
     { "type": "wokwi-servo", "id": "servo1", "top": 209.2, "left": 297.6, "attrs": {} },
     {
@@ -34,6 +34,13 @@
       "attrs": {}
     },
     { "type": "wokwi-gas-sensor", "id": "gas1", "top": -93.3, "left": -213.8, "attrs": {} },
+    {
+      "type": "wokwi-slide-potentiometer",
+      "id": "pot_smoke",
+      "top": -225.4,
+      "left": -231.4,
+      "attrs": { "travelLength": "30", "value": "0" }
+    },
     { "type": "wokwi-led", "id": "led1", "top": 140, "left": -110, "attrs": { "color": "red" } },
     {
       "type": "wokwi-resistor",
@@ -95,6 +102,9 @@
     [ "gas1:VCC", "esp:3V3", "red", [ "h50", "v90" ] ],
     [ "gas1:GND", "esp:GND.1", "black", [ "h40", "v220" ] ],
     [ "gas1:AOUT", "esp:35", "cyan", [ "h60", "v145" ] ],
+    [ "pot_smoke:VCC", "esp:3V3", "red", [ "v30", "h180" ] ],
+    [ "pot_smoke:GND", "esp:GND.1", "black", [ "v40", "h160" ] ],
+    [ "pot_smoke:SIG", "esp:33", "magenta", [ "v20", "h190", "v240" ] ],
     [ "esp:2", "led1:A", "orange", [ "h80", "v80", "h-200" ] ],
     [ "led1:C", "r1:1", "black", [ "v0" ] ],
     [ "r1:2", "esp:GND.1", "black", [ "v10", "h100" ] ],
