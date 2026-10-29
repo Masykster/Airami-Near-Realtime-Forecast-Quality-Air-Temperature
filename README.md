@@ -1,31 +1,26 @@
-# ESP32 Air Quality & Temperature Detector
+# Airami: Sistem IoT Pencegah Paparan Polusi Udara Dalam Ruang
 
 ![ESP32](https://img.shields.io/badge/ESP32-DevKit_C_V4-E7352C?style=flat-square&logo=espressif&logoColor=white)
 ![MicroPython](https://img.shields.io/badge/MicroPython-Wokwi-2B5B84?style=flat-square&logo=python&logoColor=white)
 ![MQTT](https://img.shields.io/badge/MQTT-TLS_8883-660066?style=flat-square&logo=mqtt&logoColor=white)
 ![Broker](https://img.shields.io/badge/Broker-EMQX-00B173?style=flat-square)
-![Status](https://img.shields.io/badge/status-simulasi_edukasi-lightgrey?style=flat-square)
+![Status](https://img.shields.io/badge/status-simulasi_edukasi_karhutla-lightgrey?style=flat-square)
 
-Simulasi **Wokwi** berbasis **ESP32 DevKit C V4 (MicroPython)** untuk memantau suhu,
-kelembapan, intensitas cahaya, dan kualitas udara secara real-time. Data ditampilkan
-di OLED 128x64, dikirim ke broker MQTT (EMQX) melalui TLS, dan dipakai untuk
-mengendalikan LED tiga warna, buzzer alarm, serta ventilasi otomatis (servo).
+Simulasi **Wokwi** berbasis **ESP32 DevKit C V4 (MicroPython)** untuk memantau kualitas udara secara *real-time* dengan studi kasus mitigasi **Kebakaran Hutan dan Lahan (Karhutla)**. Sistem ini memantau lima parameter lingkungan (suhu, kelembapan, cahaya, partikulat asap $\text{PM}_{2.5}$, dan gas $\text{CO}_2$), menampilkan data secara live di OLED, mengirim telemetri JSON via MQTT ke EMQX Cloud, serta mengendalikan aktuator otomatis berupa LED, *buzzer*, dan **ventilasi servo proporsional terbalik** untuk memblokir infiltrasi asap luar ruangan.
 
 > [!NOTE]
-> Proyek ini adalah simulasi/eksperimen edukasi, bukan firmware produksi.
+> Proyek ini adalah bagian dari sistem *edge-AIoT* Airami yang terintegrasi dengan dasbor analitik Google Colab (*K-Means Clustering* & *Z-Score Anomaly*) serta kendali dua arah via Bot Telegram.
 
-## Fitur
+## Fitur Utama
 
-- Pembacaan 4 parameter: suhu, kelembapan, cahaya, dan kadar gas/polusi udara
-- Filter **moving average** 3 sampel untuk meredam fluktuasi sensor
-- Tampilan live di OLED SSD1306 128x64 (I2C)
-- Publish telemetri JSON ke MQTT over TLS (port 8883) setiap 5 detik
-- Kendali remote via MQTT: LED, ventilasi, dan perpindahan mode
-- Mode **AUTO**: LED, buzzer, dan ventilasi diatur otomatis oleh logika berprioritas
-- Mode **MANUAL**: aktuator hanya berubah saat menerima perintah, dengan timeout otomatis
-  kembali ke AUTO
-- Reconnect WiFi dan MQTT **non-blocking**: kontrol lokal tetap berjalan walau jaringan putus
-- Semua logika berjalan lokal di ESP32 (edge computing), tanpa cloud rule engine
+- **Pemantauan Multi-Sensor (5 Parameter):** Membaca suhu/kelembapan (DHT22), visibilitas cahaya (LDR), partikulat asap $\text{PM}_{2.5}$ (potensiometer geser), dan gas pembakaran $\text{CO}_2$ (MQ-2).
+- **Filter Moving Average:** Penghalusan sinyal 3 sampel untuk meredam derau (*noise*) sensor.
+- **Kalkulasi EPA AQI & Faktor Lingkungan:** Konversi konsentrasi polutan ke indeks AQI standar US EPA yang dikalikan dengan faktor pengali termal dan kekeringan udara (*environmental multiplier*).
+- **Logika Ventilasi Proporsional Terbalik (*Reverse Proportional Control*):** Servo ventilasi terbuka penuh ($180^\circ$) saat udara bersih, menyempit secara proporsional ($150^\circ \rightarrow 30^\circ$) saat udara *SEDANG*, bersiaga ($30^\circ$) saat *Early Warning*, dan tertutup rapat ($0^\circ$) saat udara *BURUK* (asap pekat Karhutla).
+- **Deteksi Lonjakan Cepat (*Rate-of-Change Early Warning*):** Memicu peringatan dini akustik dan visual apabila terjadi kenaikan AQI mendadak ($\Delta\text{AQI} \ge 15\text{ poin/detik}$).
+- **Mode AUTO & MANUAL:** Logika berprioritas otomatis di sisi *edge* dengan fitur *auto-timeout* 5 menit pada mode manual demi keamanan penghuni.
+- **Integrasi Cloud & AI (Google Colab):** Visualisasi 4 panel grafik interaktif (Plotly), *K-Means Clustering* ($k=3$), dan deteksi anomali *Z-Score*.
+- **Bot Telegram Dua Arah:** Notifikasi darurat otomatis dengan *cooldown* 60 detik serta perintah kendali jarak jauh (`/status`, `/vent_open`, `/vent_close`, `/auto`).
 
 ## Komponen & Wiring
 
@@ -33,47 +28,35 @@ mengendalikan LED tiga warna, buzzer alarm, serta ventilasi otomatis (servo).
 |---|---|---|---|---|
 | DHT22 (suhu & kelembapan) | VCC / GND / SDA | 3V3 / GND / D15 | 15 | Data 1-wire |
 | OLED SSD1306 128x64 | VCC / GND / SCL / SDA | 3V3 / GND / D22 / D21 | 22, 21 | I2C alamat `0x3C` |
-| LDR (photoresistor) | VCC / GND / AO | 3V3 / GND / D34 | 34 | ADC1, input-only |
-| Gas sensor (MQ) | VCC / GND / AOUT | 3V3 / GND / D35 | 35 | ADC1, input-only |
-| LED merah + resistor 220 Ω | A → GPIO, C → resistor → GND | D2 | 2 | Status BURUK |
-| LED kuning + resistor 220 Ω | A → GPIO, C → resistor → GND | D4 | 4 | Status SEDANG / warning (berkedip) |
-| LED hijau + resistor 220 Ω | A → GPIO, C → resistor → GND | D5 | 5 | Status BAIK |
-| Servo (ventilasi) | V+ / GND / PWM | 5V / GND / D18 | 18 | PWM 50 Hz, 0° tertutup, 180° terbuka penuh |
-| Buzzer | 1 (GND) / 2 (sinyal) | GND / D19 | 19 | Digerakkan PWM |
+| Slide Potentiometer (simulasi asap $\text{PM}_{2.5}$) | VCC / GND / SIG | 3V3 / GND / D33 | 33 | ADC1, input-only |
+| LDR (photoresistor / cahaya) | VCC / GND / AO | 3V3 / GND / D34 | 34 | ADC1, input-only |
+| Sensor gas MQ-2 ($\text{CO}_2$) | VCC / GND / AOUT | 3V3 / GND / D35 | 35 | ADC1, input-only |
+| LED merah + resistor 220 Ω | A → GPIO, C → resistor → GND | D2 | 2 | Status BURUK / Asap Pekat |
+| LED kuning + resistor 220 Ω | A → GPIO, C → resistor → GND | D4 | 4 | Status SEDANG / Early Warning (kedip) |
+| LED hijau + resistor 220 Ω | A → GPIO, C → resistor → GND | D5 | 5 | Status BAIK / Udara Bersih |
+| Servo (ventilasi proporsional) | V+ / GND / PWM | 5V / GND / D18 | 18 | PWM 50 Hz: 0° tertutup rapat, 180° terbuka penuh |
+| Buzzer | 1 (GND) / 2 (sinyal) | GND / D19 | 19 | Digerakkan PWM (1500 Hz & 2000 Hz) |
 
 > [!TIP]
-> Wiring lengkap ada di [`diagram.json`](diagram.json). Pada board fisik, gunakan
-> catu daya 5V terpisah untuk servo agar ESP32 tidak *brownout*; GND harus disatukan.
+> Wiring lengkap tersedia di berkas [`diagram.json`](diagram.json). Pastikan pin analog menggunakan kanal `ADC1` (`GPIO 33`, `34`, `35`) agar dapat dibaca bersamaan saat modul WiFi aktif.
 
-## Arsitektur Singkat
+## Arsitektur Sistem
 
 ```mermaid
 flowchart LR
-    S["DHT22, LDR, Sensor Gas"] --> F["Moving average 3 sampel"]
+    S["DHT22, LDR, Potensiometer PM2.5, Sensor Gas MQ-2"] --> F["Moving average filter (3 sampel)"]
     F --> O["OLED SSD1306"]
-    F --> K["Status udara + histeresis"]
-    CAL["Kalibrasi dinamis saat boot"] --> K
-    F --> P["Predictive warning (laju kenaikan gas)"]
-    K --> A["Logika AUTO berprioritas"]
+    F --> K["Multi-Sensor EPA AQI + Histeresis"]
+    CAL["Kalibrasi titik nol gas saat boot"] --> K
+    F --> P["Spike Early Warning (Delta AQI)"]
+    K --> A["Logika AUTO berprioritas (Reversed Servo)"]
     P --> A
-    F --> T["Override suhu"]
+    F --> T["Override Suhu (>32°C & Udara Bersih)"]
     T --> A
-    A --> L["LED merah / kuning / hijau"]
-    A --> Z["Buzzer"]
-    A --> V["Servo ventilasi (proporsional)"]
-    F --> M["WiFi + MQTT TLS"]
-    M <--> B[("Broker EMQX")]
-    B -- perintah --> C["Handler MQTT"]
-    C --> L
-    C --> Z
-    C --> V
-```
-
-Alur utama:
-
-1. Saat boot, sistem mengambil baseline gas selama sekitar 3 detik dan menghitung threshold.
-2. Setiap 1 detik sensor dibaca dan dihaluskan dengan moving average.
-3. Status udara dihitung (dengan histeresis) dan laju kenaikan gas dipantau.
-4. Jika mode `AUTO`, logika berprioritas mengatur LED, buzzer, dan servo.
-5. Setiap 5 detik nilai dipublikasikan sebagai JSON. OLED diperbarui setiap pembacaan.
-6. Perintah MQTT dapat mengubah aktuator dan memindahkan sistem ke mode `MANUAL`.
+    A --> L["LED Merah / Kuning / Hijau"]
+    A --> Z["Buzzer Alarm"]
+    A --> V["Servo Ventilasi (0° - 180° Proporsional)"]
+    F --> M["WiFi + MQTT TLS (Port 8883)"]
+    M <--> B[("Broker EMQX Cloud")]
+    B -- Telemetri JSON --> C["Google Colab (Plotly, K-Means, Z-Score)"]
+    B -- Notifikasi & Kendali --> TG["Bot Telegram (API)"]
